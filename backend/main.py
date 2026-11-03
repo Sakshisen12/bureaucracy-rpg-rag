@@ -15,9 +15,7 @@ load_dotenv()
 
 app = FastAPI()
 
-# -------------------------------------------------------------------
-# Universal CORS Configuration
-# -------------------------------------------------------------------
+# Enable Permissive CORS for Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,7 +41,7 @@ class GameTurnOutput(BaseModel):
 def read_root():
     return {"status": "online", "message": "Bureaucracy RPG API is running!"}
 
-# Handles both /upload and /upload/ to prevent 404 routing redirects
+# Register dual routes to prevent 404 redirect issues
 @app.post("/upload")
 @app.post("/upload/")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -59,6 +57,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_documents(docs)
 
+        # Light local embeddings
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         vectorstore = Chroma.from_documents(chunks, embeddings)
         
