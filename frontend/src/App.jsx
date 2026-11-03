@@ -15,7 +15,7 @@ import {
   Terminal
 } from 'lucide-react';
 
-const API_BASE_URL = 'https://bureaucracy-rpg-api.onrender.com';
+const API_BASE_URL = 'https://bureaucracy-rpg-rag.onrender.com';
 
 export default function App() {
   const [gameState, setGameState] = useState({

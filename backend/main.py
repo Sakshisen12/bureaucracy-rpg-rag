@@ -1,6 +1,5 @@
 import os
 import tempfile
-from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,24 +13,24 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
-# Global singletons — instantiated once at startup to avoid per-request OOM
+# Global singletons — lazy-loaded on first /upload request to avoid startup OOM
+# on Render free tier (512 MB RAM). PyTorch + sentence-transformers = ~1.5 GB peak.
 vectorstore = None
-embeddings = None
+_embeddings = None
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Pre-warm the HuggingFace embedding model on startup.
-    This prevents the first /upload request from timing out or OOM-crashing
-    on Render's free tier while the model downloads (~90 MB).
+def get_embeddings() -> HuggingFaceEmbeddings:
+    """Return a cached HuggingFaceEmbeddings instance.
+    Defers heavy model loading until first PDF upload so the service
+    can boot successfully within Render's free-tier memory limit.
     """
-    global embeddings
-    print("[Startup] Loading HuggingFace embedding model...")
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    print("[Startup] Embedding model ready.")
-    yield
-    print("[Shutdown] Cleaning up resources.")
+    global _embeddings
+    if _embeddings is None:
+        print("[Embeddings] Loading model (first request)...")
+        _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        print("[Embeddings] Model loaded and cached.")
+    return _embeddings
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 # Enable Permissive CORS for Vercel
 app.add_middleware(
@@ -75,8 +74,8 @@ async def upload_pdf(file: UploadFile = File(...)):
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_documents(docs)
 
-        # Use pre-warmed global embeddings instance (loaded at startup)
-        vectorstore = Chroma.from_documents(chunks, embeddings)
+        # Use lazily-loaded, cached embeddings singleton
+        vectorstore = Chroma.from_documents(chunks, get_embeddings())
         
         os.remove(tmp_path)
         return {"status": "success", "message": f"Processed {len(chunks)} chunks"}

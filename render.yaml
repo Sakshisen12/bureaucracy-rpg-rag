@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: bureaucracy-rpg-api
+    name: bureaucracy-rpg-rag
     runtime: python
     rootDir: backend
     buildCommand: pip install -r requirements.txt
