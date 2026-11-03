@@ -7,17 +7,16 @@ from pydantic import BaseModel, Field
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_community.retrievers import BM25Retriever
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Global in-memory vector store (reset on each new PDF upload).
-# Uses Google's embedding API — zero local model downloads, zero PyTorch,
-# fits comfortably within Render's 512 MB free-tier RAM.
+# Global BM25 retriever — pure Python keyword retrieval, zero local model,
+# zero API calls during PDF upload. No PyTorch, no embeddings, no quota issues.
 # ---------------------------------------------------------------------------
-vectorstore: InMemoryVectorStore | None = None
+retriever: BM25Retriever | None = None
 
 app = FastAPI()
 
@@ -52,37 +51,32 @@ def read_root():
 @app.post("/upload")
 @app.post("/upload/")
 async def upload_pdf(file: UploadFile = File(...)):
-    global vectorstore
-
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="GOOGLE_API_KEY missing — add it in Render Environment settings."
-        )
-
+    global retriever
     try:
+        # Save upload to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
 
+        # Load and chunk the PDF
         loader = PyPDFLoader(tmp_path)
         docs = loader.load()
         os.remove(tmp_path)
 
+        if not docs:
+            raise HTTPException(status_code=400, detail="PDF appears to be empty or unreadable.")
+
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_documents(docs)
 
-        # Google Generative AI Embeddings — API-based, no local model / no PyTorch
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=api_key,
-        )
-        vectorstore = InMemoryVectorStore.from_documents(chunks, embeddings)
+        # BM25 keyword retrieval — pure Python, no API, no embeddings, no PyTorch
+        retriever = BM25Retriever.from_documents(chunks, k=3)
 
-        return {"status": "success", "message": f"Processed {len(chunks)} chunks"}
+        return {"status": "success", "message": f"Processed {len(chunks)} chunks from {len(docs)} pages"}
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[upload] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Upload Error: {str(e)}")
@@ -91,9 +85,9 @@ async def upload_pdf(file: UploadFile = File(...)):
 @app.post("/evaluate")
 @app.post("/evaluate/")
 async def evaluate_action(req: ActionRequest):
-    global vectorstore
+    global retriever
 
-    if not vectorstore:
+    if retriever is None:
         raise HTTPException(status_code=400, detail="Upload a PDF document first!")
 
     api_key = os.getenv("GOOGLE_API_KEY")
@@ -104,7 +98,7 @@ async def evaluate_action(req: ActionRequest):
         )
 
     try:
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+        # Retrieve relevant policy chunks via BM25 keyword matching
         docs = retriever.invoke(req.action)
         context = "\n\n".join([doc.page_content for doc in docs])
 
@@ -117,6 +111,7 @@ async def evaluate_action(req: ActionRequest):
 
         prompt = f"""
         You are a humorous compliance Game Master evaluating an employee's action against company policies.
+
         DOCUMENT RULES CONTEXT:
         {context}
 
