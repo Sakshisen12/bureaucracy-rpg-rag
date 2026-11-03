@@ -103,7 +103,7 @@ async def evaluate_action(req: ActionRequest):
         context = "\n\n".join([doc.page_content for doc in docs])
 
         llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
+            model="gemini-3.8-flash",
             temperature=0.3,
             google_api_key=api_key,
         )
