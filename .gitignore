@@ -1,0 +1,16 @@
+# Backend Environment & Secret Keys
+backend/.env
+backend/venv/
+__pycache__/
+*.pyc
+.chroma/
+
+# Frontend Dependencies & Builds
+frontend/node_modules/
+frontend/dist/
+
+# Operating System & IDE Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
