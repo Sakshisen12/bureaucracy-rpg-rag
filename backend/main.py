@@ -1,5 +1,6 @@
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +14,24 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
-app = FastAPI()
+# Global singletons — instantiated once at startup to avoid per-request OOM
+vectorstore = None
+embeddings = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Pre-warm the HuggingFace embedding model on startup.
+    This prevents the first /upload request from timing out or OOM-crashing
+    on Render's free tier while the model downloads (~90 MB).
+    """
+    global embeddings
+    print("[Startup] Loading HuggingFace embedding model...")
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    print("[Startup] Embedding model ready.")
+    yield
+    print("[Shutdown] Cleaning up resources.")
+
+app = FastAPI(lifespan=lifespan)
 
 # Enable Permissive CORS for Vercel
 app.add_middleware(
@@ -24,7 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-vectorstore = None
+
 
 class ActionRequest(BaseModel):
     action: str
@@ -57,8 +75,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_documents(docs)
 
-        # Light local embeddings
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        # Use pre-warmed global embeddings instance (loaded at startup)
         vectorstore = Chroma.from_documents(chunks, embeddings)
         
         os.remove(tmp_path)
