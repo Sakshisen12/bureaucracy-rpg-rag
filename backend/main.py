@@ -16,17 +16,12 @@ load_dotenv()
 app = FastAPI()
 
 # -------------------------------------------------------------------
-# Strict CORS Setup (Fixes allow_credentials wildcard conflict)
+# Universal CORS Configuration
 # -------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex="https://.*\.vercel\.app",  # Matches all Vercel deployment URLs dynamically
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "https://bureaucracy-rpg-rag.vercel.app"
-    ],
-    allow_credentials=False,  # Set to False when using wildcards or dynamic origins
+    allow_origins=["*"],
+    allow_credentials=False,  # Must be False when allow_origins is ["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -48,7 +43,9 @@ class GameTurnOutput(BaseModel):
 def read_root():
     return {"status": "online", "message": "Bureaucracy RPG API is running!"}
 
+# Handles both /upload and /upload/ to prevent 404 routing redirects
 @app.post("/upload")
+@app.post("/upload/")
 async def upload_pdf(file: UploadFile = File(...)):
     global vectorstore
     try:
@@ -62,7 +59,6 @@ async def upload_pdf(file: UploadFile = File(...)):
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_documents(docs)
 
-        # Light local embeddings model
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         vectorstore = Chroma.from_documents(chunks, embeddings)
         
@@ -73,6 +69,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Backend Error: {str(e)}")
 
 @app.post("/evaluate")
+@app.post("/evaluate/")
 async def evaluate_action(req: ActionRequest):
     global vectorstore
     if not vectorstore:
