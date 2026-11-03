@@ -11,12 +11,10 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-# Load environment variables from .env file
 load_dotenv()
 
 app = FastAPI()
 
-# Enable CORS for React Frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,7 +23,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global vectorstore reference
 vectorstore = None
 
 class ActionRequest(BaseModel):
@@ -38,6 +35,10 @@ class GameTurnOutput(BaseModel):
     compliance_change: int = Field(description="Stat change (-30 to +10)")
     budget_change: int = Field(description="Budget expense delta in dollars")
     sanity_change: int = Field(description="Sanity change (-20 to +5)")
+
+@app.get("/")
+def read_root():
+    return {"status": "online", "message": "Bureaucracy RPG API is running!"}
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -53,14 +54,16 @@ async def upload_pdf(file: UploadFile = File(...)):
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_documents(docs)
 
-        # Local HuggingFace Embeddings
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        
+        # Use ephemeral in-memory store for Render free instance stability
         vectorstore = Chroma.from_documents(chunks, embeddings)
         
         os.remove(tmp_path)
         return {"status": "success", "message": f"Processed {len(chunks)} chunks"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error during PDF upload: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Backend Error: {str(e)}")
 
 @app.post("/evaluate")
 async def evaluate_action(req: ActionRequest):
@@ -70,34 +73,32 @@ async def evaluate_action(req: ActionRequest):
     
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="Backend GOOGLE_API_KEY not configured in .env file!")
+        raise HTTPException(status_code=500, detail="Backend GOOGLE_API_KEY missing in Render env settings!")
     
-    # Perform Vector Search
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    docs = retriever.invoke(req.action)
-    context = "\n\n".join([doc.page_content for doc in docs])
+    try:
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+        docs = retriever.invoke(req.action)
+        context = "\n\n".join([doc.page_content for doc in docs])
 
-    # Instantiate Gemini via Backend Key
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3, google_api_key=api_key)
-    structured_llm = llm.with_structured_output(GameTurnOutput)
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3, google_api_key=api_key)
+        structured_llm = llm.with_structured_output(GameTurnOutput)
 
-    prompt = f"""
-    You are a humorous compliance Game Master evaluating an employee's action against company policies.
-    DOCUMENT RULES CONTEXT:
-    {context}
-    
-    CURRENT PLAYER STATS:
-    {req.game_state}
-    
-    PLAYER ACTION:
-    {req.action}
-    
-    Evaluate compliance against rules and return JSON formatted result.
-    """
-    
-    result = structured_llm.invoke(prompt)
-    return result.model_dump()
-
-@app.get("/")
-def read_root():
-    return {"status": "online", "message": "Bureaucracy RPG API is running!"}
+        prompt = f"""
+        You are a humorous compliance Game Master evaluating an employee's action against company policies.
+        DOCUMENT RULES CONTEXT:
+        {context}
+        
+        CURRENT PLAYER STATS:
+        {req.game_state}
+        
+        PLAYER ACTION:
+        {req.action}
+        
+        Evaluate compliance against rules and return JSON formatted result.
+        """
+        
+        result = structured_llm.invoke(prompt)
+        return result.model_dump()
+    except Exception as e:
+        print(f"Error during evaluation: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Evaluation Error: {str(e)}")
