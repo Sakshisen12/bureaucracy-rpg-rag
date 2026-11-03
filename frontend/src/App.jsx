@@ -52,7 +52,7 @@ export default function App() {
     "Take 3 days off during end-of-quarter freeze"
   ];
 
-  const handleFileUpload = async (e) => {
+const handleFileUpload = async (e) => {
     const selectedFile = e.target.files[0];
     if (!selectedFile) return;
 
@@ -64,19 +64,18 @@ export default function App() {
     formData.append('file', selectedFile);
 
     try {
-      const response = await axios.post(`${API_BASE_URL}/upload`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
-      });
+      // Allow browser to automatically set boundary for multipart/form-data
+      const response = await axios.post(`${API_BASE_URL}/upload`, formData);
 
       if (response.data.status === 'success') {
         setUploadStatus('success');
       }
     } catch (err) {
+      console.error('Upload Error:', err);
       setUploadStatus('error');
       setErrorMsg(err.response?.data?.detail || 'Failed to upload and process PDF');
     }
   };
-
   const handleActionSubmit = async (actionToSubmit) => {
     const actionText = actionToSubmit || userAction;
     if (!actionText.trim()) return;

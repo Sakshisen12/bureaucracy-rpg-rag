@@ -15,12 +15,16 @@ load_dotenv()
 
 app = FastAPI()
 
+# -------------------------------------------------------------------
+# CORS Configuration - Explicitly Allow Vercel & All Origins
+# -------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows all origins including Vercel
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 vectorstore = None
@@ -55,8 +59,6 @@ async def upload_pdf(file: UploadFile = File(...)):
         chunks = text_splitter.split_documents(docs)
 
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        
-        # Use ephemeral in-memory store for Render free instance stability
         vectorstore = Chroma.from_documents(chunks, embeddings)
         
         os.remove(tmp_path)
