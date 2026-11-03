@@ -16,15 +16,19 @@ load_dotenv()
 app = FastAPI()
 
 # -------------------------------------------------------------------
-# CORS Configuration - Explicitly Allow Vercel & All Origins
+# Strict CORS Setup (Fixes allow_credentials wildcard conflict)
 # -------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins including Vercel
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"],
+    allow_origin_regex="https://.*\.vercel\.app",  # Matches all Vercel deployment URLs dynamically
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://bureaucracy-rpg-rag.vercel.app"
+    ],
+    allow_credentials=False,  # Set to False when using wildcards or dynamic origins
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
 
 vectorstore = None
@@ -58,6 +62,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_documents(docs)
 
+        # Light local embeddings model
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         vectorstore = Chroma.from_documents(chunks, embeddings)
         
