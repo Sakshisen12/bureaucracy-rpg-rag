@@ -97,3 +97,7 @@ async def evaluate_action(req: ActionRequest):
     
     result = structured_llm.invoke(prompt)
     return result.model_dump()
+
+@app.get("/")
+def read_root():
+    return {"status": "online", "message": "Bureaucracy RPG API is running!"}
