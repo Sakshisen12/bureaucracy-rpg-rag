@@ -184,9 +184,9 @@ async def evaluate_action(req: ActionRequest, request: Request):
         raise
     except Exception as e:
         error_str = str(e)
-        print(f"[evaluate] Error: {e}")
+        print(f"[evaluate] FULL ERROR TYPE: {type(e).__name__}")
+        print(f"[evaluate] FULL ERROR STR: {error_str}")
 
-        # User-friendly error messages for known Google API errors
         if "503" in error_str or "UNAVAILABLE" in error_str:
             raise HTTPException(
                 status_code=503,
@@ -197,9 +197,9 @@ async def evaluate_action(req: ActionRequest, request: Request):
                 status_code=429,
                 detail="API quota exhausted for today. The game will resume tomorrow."
             )
-        if "404" in error_str or "NOT_FOUND" in error_str:
+        if "NOT_FOUND" in error_str:
             raise HTTPException(
                 status_code=500,
-                detail="AI model not found. Contact the developer to update the model name."
+                detail=f"Model error: {error_str[:400]}"
             )
-        raise HTTPException(status_code=500, detail=f"Evaluation Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Evaluation Error: {error_str[:500]}")
