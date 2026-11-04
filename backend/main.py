@@ -25,7 +25,7 @@ retriever: BM25Retriever | None = None
 # No Google SDK needed, works with any valid AI Studio API key
 # ---------------------------------------------------------------------------
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
-GEMINI_MODEL = "gemini-2.0-flash"  # updated model name
+GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_URL = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
 
 # ---------------------------------------------------------------------------
