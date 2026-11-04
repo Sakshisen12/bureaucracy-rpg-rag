@@ -23,10 +23,21 @@ retriever: BM25Retriever | None = None
 # ---------------------------------------------------------------------------
 # Groq REST API — OpenAI-compatible endpoint, no SDK needed
 # Free tier: ~14,400 requests/day, 30 req/min
+#
+# Models listed in preference order — the app tries each one automatically.
+# If a model is decommissioned or unavailable, it moves to the next.
 # ---------------------------------------------------------------------------
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
-GROQ_MODEL_FALLBACK = "llama-3.1-8b-instant"  # smaller/faster fallback
+
+GROQ_MODELS = [
+    "llama-3.1-8b-instant",        # ✅ confirmed active on free tier
+    "llama-3.1-70b-versatile",     # larger model, may need access
+    "llama-3.3-70b-versatile",     # newest 70B
+    "llama3-groq-8b-8192-tool-use-preview",  # preview fallback
+]
+
+# Cache which model worked so we don't retry unavailable ones every request
+_working_model: str | None = None
 
 # ---------------------------------------------------------------------------
 # Simple in-memory rate limiter
@@ -48,17 +59,29 @@ def check_rate_limit(ip: str):
     _rate_limit_store[ip].append(now)
 
 
-async def call_groq(api_key: str, prompt: str, max_retries: int = 5) -> dict:
-    """Call Groq REST API (OpenAI-compatible). Returns parsed JSON dict."""
+async def call_groq(api_key: str, prompt: str) -> dict:
+    """
+    Call Groq REST API. Automatically tries each model in GROQ_MODELS
+    until one succeeds, skipping decommissioned or unavailable ones.
+    """
+    global _working_model
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
-    last_error = None
-    for attempt in range(max_retries):
-        # Switch to smaller fallback model on last 2 attempts
-        model = GROQ_MODEL_FALLBACK if attempt >= max_retries - 2 else GROQ_MODEL
+    # Try cached working model first, then fall through the full list
+    models_to_try = []
+    if _working_model:
+        models_to_try.append(_working_model)
+    for m in GROQ_MODELS:
+        if m not in models_to_try:
+            models_to_try.append(m)
+
+    last_error: Exception | None = None
+
+    for model in models_to_try:
         body = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -69,49 +92,57 @@ async def call_groq(api_key: str, prompt: str, max_retries: int = 5) -> dict:
             async with httpx.AsyncClient(timeout=45.0) as client:
                 resp = await client.post(GROQ_URL, json=body, headers=headers)
 
-            print(f"[groq] model={model} status={resp.status_code} attempt={attempt+1}")
+            print(f"[groq] model={model} status={resp.status_code}")
 
-            if resp.status_code == 429:
+            # Model not available on this account — skip to next
+            if resp.status_code == 404:
+                print(f"[groq] {model} → 404 not found, trying next model...")
+                last_error = Exception(f"{model}: 404 not found")
+                if model == _working_model:
+                    _working_model = None  # invalidate cache
+                continue
+
+            # Decommissioned or bad model name — skip to next
+            if resp.status_code == 400:
                 raw = resp.text
-                print(f"[groq] 429 raw: {raw[:300]}")
-
-                # Daily limit exhausted — no point retrying today
-                if "daily" in raw.lower() or "exhausted" in raw.lower():
-                    raise HTTPException(
-                        status_code=429,
-                        detail="Groq daily quota exhausted. Free tier allows ~14,400 req/day. Please try again tomorrow or get a paid plan at console.groq.com."
-                    )
-
-                # Per-minute rate limit — retry with backoff
-                if attempt < max_retries - 1:
-                    wait = 15 * (attempt + 1)  # 15s, 30s, 45s
-                    print(f"[groq] 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
-                    time.sleep(wait)
-                    last_error = Exception("429 RATE_LIMIT")
+                if "decommissioned" in raw or "model_not_found" in raw or "does not exist" in raw:
+                    print(f"[groq] {model} → decommissioned/not found, trying next model...")
+                    last_error = Exception(f"{model}: decommissioned")
+                    if model == _working_model:
+                        _working_model = None
                     continue
-
-                raise HTTPException(
-                    status_code=429,
-                    detail="Groq rate limit hit. Free tier allows ~30 req/min. Please wait a minute and try again."
-                )
-
-            if resp.status_code == 503:
-                if attempt < max_retries - 1:
-                    wait = min(5 * (2 ** attempt), 30)
-                    print(f"[groq] 503 overloaded, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
-                    time.sleep(wait)
-                    last_error = Exception("503 UNAVAILABLE")
-                    continue
-                raise HTTPException(status_code=503, detail="Groq servers are overloaded right now. Please wait 30 seconds and try again.")
 
             if resp.status_code == 401:
                 raise HTTPException(
                     status_code=500,
-                    detail="Groq API key is invalid or missing — check GROQ_API_KEY in your environment variables."
+                    detail="Groq API key is invalid — check GROQ_API_KEY in Render Environment settings."
                 )
 
+            if resp.status_code == 429:
+                raw = resp.text
+                if "daily" in raw.lower() or "exhausted" in raw.lower():
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Groq daily quota exhausted. Free tier allows ~14,400 req/day. Try again tomorrow or visit console.groq.com."
+                    )
+                # Per-minute rate limit — wait briefly and retry same model
+                print(f"[groq] {model} → rate limited, waiting 15s...")
+                time.sleep(15)
+                continue
+
+            if resp.status_code == 503:
+                print(f"[groq] {model} → 503 overloaded, waiting 10s...")
+                time.sleep(10)
+                continue
+
             if resp.status_code != 200:
-                raise HTTPException(status_code=500, detail=f"Groq API error {resp.status_code}: {resp.text[:300]}")
+                print(f"[groq] {model} → error {resp.status_code}: {resp.text[:200]}")
+                last_error = Exception(f"{model}: HTTP {resp.status_code}")
+                continue
+
+            # ✅ Success — cache this model
+            _working_model = model
+            print(f"[groq] ✅ success with model={model}")
 
             data = resp.json()
             text = data["choices"][0]["message"]["content"].strip()
@@ -127,12 +158,16 @@ async def call_groq(api_key: str, prompt: str, max_retries: int = 5) -> dict:
             raise
         except Exception as e:
             last_error = e
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-            else:
-                raise
+            print(f"[groq] exception on {model}: {e}")
+            continue
 
-    raise last_error
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            f"All Groq models failed or are unavailable. Last error: {last_error}. "
+            "Visit console.groq.com to check which models are active for your account."
+        )
+    )
 
 
 app = FastAPI()
@@ -157,7 +192,8 @@ def read_root():
         "status": "online",
         "message": "Bureaucracy RPG API is running!",
         "rate_limit": f"{MAX_REQUESTS_PER_WINDOW} evaluations/hour per user",
-        "model": GROQ_MODEL
+        "models": GROQ_MODELS,
+        "active_model": _working_model or "auto-detect on first request"
     }
 
 
