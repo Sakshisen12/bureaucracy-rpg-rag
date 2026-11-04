@@ -21,14 +21,12 @@ load_dotenv()
 retriever: BM25Retriever | None = None
 
 # ---------------------------------------------------------------------------
-# Gemini REST API — uses stable v1beta endpoint directly with httpx
-# No Google SDK needed, works with any valid AI Studio API key
+# Groq REST API — OpenAI-compatible endpoint, no SDK needed
+# Free tier: ~14,400 requests/day, 30 req/min
 # ---------------------------------------------------------------------------
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
-GEMINI_MODEL = "gemini-3.8-flash"
-GEMINI_MODEL_FALLBACK = "gemini-1.5-flash"  # fallback if primary is overloaded
-GEMINI_URL = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
-GEMINI_URL_FALLBACK = f"{GEMINI_BASE}/models/{GEMINI_MODEL_FALLBACK}:generateContent"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL_FALLBACK = "llama3-8b-8192"  # smaller/faster fallback
 
 # ---------------------------------------------------------------------------
 # Simple in-memory rate limiter
@@ -50,81 +48,73 @@ def check_rate_limit(ip: str):
     _rate_limit_store[ip].append(now)
 
 
-async def call_gemini(api_key: str, prompt: str, max_retries: int = 5) -> dict:
-    """Call Gemini REST API directly. Returns parsed JSON dict."""
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.3,
-            "responseMimeType": "application/json",
-            # Disable thinking mode — saves quota and avoids parsing thought chunks
-            "thinkingConfig": {"thinkingBudget": 0}
-        }
+async def call_groq(api_key: str, prompt: str, max_retries: int = 5) -> dict:
+    """Call Groq REST API (OpenAI-compatible). Returns parsed JSON dict."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
 
     last_error = None
     for attempt in range(max_retries):
-        # Switch to fallback model on last 2 attempts if primary keeps failing
-        url = GEMINI_URL_FALLBACK if attempt >= max_retries - 2 else GEMINI_URL
-        model_used = GEMINI_MODEL_FALLBACK if attempt >= max_retries - 2 else GEMINI_MODEL
+        # Switch to smaller fallback model on last 2 attempts
+        model = GROQ_MODEL_FALLBACK if attempt >= max_retries - 2 else GROQ_MODEL
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "response_format": {"type": "json_object"},
+        }
         try:
             async with httpx.AsyncClient(timeout=45.0) as client:
-                resp = await client.post(
-                    url,
-                    json=body,
-                    params={"key": api_key}
-                )
+                resp = await client.post(GROQ_URL, json=body, headers=headers)
 
-            print(f"[gemini] model={model_used} status={resp.status_code} attempt={attempt+1}")
+            print(f"[groq] model={model} status={resp.status_code} attempt={attempt+1}")
 
             if resp.status_code == 429:
                 raw = resp.text
-                print(f"[gemini] 429 raw: {raw[:300]}")
+                print(f"[groq] 429 raw: {raw[:300]}")
 
-                # Check if daily quota is exhausted (no point retrying)
-                if "quota" in raw.lower() or "exhausted" in raw.lower() or "day" in raw.lower():
+                # Daily limit exhausted — no point retrying today
+                if "daily" in raw.lower() or "exhausted" in raw.lower():
                     raise HTTPException(
                         status_code=429,
-                        detail="Daily API quota exhausted. The free tier allows limited requests per day. Please try again tomorrow or upgrade your API plan at aistudio.google.com."
+                        detail="Groq daily quota exhausted. Free tier allows ~14,400 req/day. Please try again tomorrow or get a paid plan at console.groq.com."
                     )
 
                 # Per-minute rate limit — retry with backoff
                 if attempt < max_retries - 1:
                     wait = 15 * (attempt + 1)  # 15s, 30s, 45s
-                    print(f"[gemini] 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+                    print(f"[groq] 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
                     time.sleep(wait)
                     last_error = Exception("429 RATE_LIMIT")
                     continue
 
                 raise HTTPException(
                     status_code=429,
-                    detail="Google API rate limit hit. Free tier allows ~15 requests/min. Please wait 1-2 minutes and try again."
+                    detail="Groq rate limit hit. Free tier allows ~30 req/min. Please wait a minute and try again."
                 )
+
             if resp.status_code == 503:
                 if attempt < max_retries - 1:
-                    wait = min(5 * (2 ** attempt), 30)  # 5s, 10s, 20s, 30s, 30s
-                    print(f"[gemini] 503 overloaded, retrying in {wait}s (attempt {attempt+1}/{max_retries}, model={model_used})")
+                    wait = min(5 * (2 ** attempt), 30)
+                    print(f"[groq] 503 overloaded, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
                     time.sleep(wait)
                     last_error = Exception("503 UNAVAILABLE")
                     continue
-                raise HTTPException(status_code=503, detail="Google AI servers are overloaded right now. This is a temporary Google issue — please wait 30 seconds and try again.")
-            if resp.status_code == 404:
-                detail = resp.text[:500]
-                print(f"[gemini] 404 error: {detail}")
+                raise HTTPException(status_code=503, detail="Groq servers are overloaded right now. Please wait 30 seconds and try again.")
+
+            if resp.status_code == 401:
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Gemini API 404 — check your GOOGLE_API_KEY in Render. Raw: {detail[:300]}"
+                    detail="Groq API key is invalid or missing — check GROQ_API_KEY in your environment variables."
                 )
+
             if resp.status_code != 200:
-                raise HTTPException(status_code=500, detail=f"Gemini API error {resp.status_code}: {resp.text[:300]}")
+                raise HTTPException(status_code=500, detail=f"Groq API error {resp.status_code}: {resp.text[:300]}")
 
             data = resp.json()
-            parts = data["candidates"][0]["content"]["parts"]
-
-            # Thinking models return thought chunks first, then the real answer.
-            # Skip any part marked with "thought": true and take the last remaining part.
-            answer_parts = [p["text"] for p in parts if not p.get("thought", False)]
-            text = (answer_parts[-1] if answer_parts else parts[-1]["text"]).strip()
+            text = data["choices"][0]["message"]["content"].strip()
 
             # Strip markdown code fences if present
             if text.startswith("```"):
@@ -167,21 +157,21 @@ def read_root():
         "status": "online",
         "message": "Bureaucracy RPG API is running!",
         "rate_limit": f"{MAX_REQUESTS_PER_WINDOW} evaluations/hour per user",
-        "model": GEMINI_MODEL
+        "model": GROQ_MODEL
     }
 
 
 @app.get("/models")
 async def list_models():
-    """Debug endpoint — lists all Gemini models available for the configured API key."""
-    api_key = os.getenv("GOOGLE_API_KEY")
+    """Debug endpoint — lists all Groq models available for the configured API key."""
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        return {"error": "GOOGLE_API_KEY not set in environment"}
+        return {"error": "GROQ_API_KEY not set in environment"}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{GEMINI_BASE}/models",
-                params={"key": api_key}
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"}
             )
         return {"status": resp.status_code, "body": resp.json()}
     except Exception as e:
@@ -229,11 +219,11 @@ async def evaluate_action(req: ActionRequest, request: Request):
     client_ip = request.headers.get("x-forwarded-for", request.client.host)
     check_rate_limit(client_ip)
 
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise HTTPException(
             status_code=500,
-            detail="GOOGLE_API_KEY missing — add it in Render Environment settings."
+            detail="GROQ_API_KEY missing — add it in Render Environment settings."
         )
 
     docs = retriever.invoke(req.action)
@@ -259,7 +249,7 @@ Evaluate the action against the document rules. Respond ONLY with a valid JSON o
   "sanity_change": <integer between -20 and +5>
 }}"""
 
-    result = await call_gemini(api_key, prompt)
+    result = await call_groq(api_key, prompt)
 
     # Validate required fields
     required = ["narrative", "clause_cited", "compliance_change", "budget_change", "sanity_change"]
