@@ -1,16 +1,18 @@
 import os
 import time
+import json
 import tempfile
 from collections import defaultdict
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+import google.generativeai as genai
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.retrievers import BM25Retriever
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
@@ -28,10 +30,10 @@ MAX_REQUESTS_PER_WINDOW = 10        # max /evaluate calls per IP
 WINDOW_SECONDS = 60 * 60            # 1 hour window
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
 
+
 def check_rate_limit(ip: str):
     now = time.time()
     window_start = now - WINDOW_SECONDS
-    # Keep only timestamps within the current window
     _rate_limit_store[ip] = [t for t in _rate_limit_store[ip] if t > window_start]
     if len(_rate_limit_store[ip]) >= MAX_REQUESTS_PER_WINDOW:
         raise HTTPException(
@@ -40,23 +42,28 @@ def check_rate_limit(ip: str):
         )
     _rate_limit_store[ip].append(now)
 
-# ---------------------------------------------------------------------------
-# Retry helper for transient Google API errors (503 / 429 / 500)
-# ---------------------------------------------------------------------------
-RETRYABLE_CODES = {503, 429, 500}
 
-def invoke_with_retry(structured_llm, prompt: str, max_retries: int = 3):
-    """Call the LLM with exponential backoff on transient errors."""
+# ---------------------------------------------------------------------------
+# Call Gemini with retry logic for transient errors
+# ---------------------------------------------------------------------------
+def call_gemini_with_retry(model, prompt: str, max_retries: int = 3) -> dict:
+    """Call Gemini directly and parse JSON response, with exponential backoff."""
     last_error = None
     for attempt in range(max_retries):
         try:
-            return structured_llm.invoke(prompt)
+            response = model.generate_content(prompt)
+            text = response.text.strip()
+            # Strip markdown code fences if present
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            return json.loads(text)
         except Exception as e:
             error_str = str(e)
-            # Check if this is a retryable transient error
-            is_retryable = any(str(code) in error_str for code in RETRYABLE_CODES)
+            is_retryable = "503" in error_str or "429" in error_str or "UNAVAILABLE" in error_str
             if is_retryable and attempt < max_retries - 1:
-                wait = 2 ** attempt  # 1s, 2s, 4s
+                wait = 2 ** attempt
                 print(f"[evaluate] Transient error (attempt {attempt+1}), retrying in {wait}s: {e}")
                 time.sleep(wait)
                 last_error = e
@@ -80,14 +87,6 @@ app.add_middleware(
 class ActionRequest(BaseModel):
     action: str
     game_state: dict
-
-
-class GameTurnOutput(BaseModel):
-    narrative: str = Field(description="Story consequence of player action")
-    clause_cited: str = Field(description="Exact document rule/clause reference used")
-    compliance_change: int = Field(description="Stat change (-30 to +10)")
-    budget_change: int = Field(description="Budget expense delta in dollars")
-    sanity_change: int = Field(description="Sanity change (-20 to +5)")
 
 
 @app.get("/")
@@ -154,38 +153,52 @@ async def evaluate_action(req: ActionRequest, request: Request):
         docs = retriever.invoke(req.action)
         context = "\n\n".join([doc.page_content for doc in docs])
 
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
-            temperature=0.3,
-            google_api_key=api_key,
+        # Configure Google Generative AI directly (no langchain wrapper)
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.3,
+                response_mime_type="application/json",
+            )
         )
-        structured_llm = llm.with_structured_output(GameTurnOutput)
 
-        prompt = f"""
-        You are a humorous compliance Game Master evaluating an employee's action against company policies.
+        prompt = f"""You are a humorous compliance Game Master evaluating an employee's action against company policies.
 
-        DOCUMENT RULES CONTEXT:
-        {context}
+DOCUMENT RULES CONTEXT:
+{context}
 
-        CURRENT PLAYER STATS:
-        {req.game_state}
+CURRENT PLAYER STATS:
+{req.game_state}
 
-        PLAYER ACTION:
-        {req.action}
+PLAYER ACTION:
+{req.action}
 
-        Evaluate compliance against the document rules and return a JSON formatted result.
-        """
+Evaluate the action against the document rules. Respond ONLY with a valid JSON object with exactly these fields:
+{{
+  "narrative": "A humorous 2-3 sentence story consequence of the action, referencing the policy",
+  "clause_cited": "The exact section/clause name from the document that applies",
+  "compliance_change": <integer between -30 and +10>,
+  "budget_change": <integer, negative means money spent>,
+  "sanity_change": <integer between -20 and +5>
+}}"""
 
-        # Retry up to 3 times on transient 503/429 errors
-        result = invoke_with_retry(structured_llm, prompt, max_retries=3)
-        return result.model_dump()
+        result = call_gemini_with_retry(model, prompt)
+
+        # Validate required fields exist
+        required = ["narrative", "clause_cited", "compliance_change", "budget_change", "sanity_change"]
+        for field in required:
+            if field not in result:
+                raise ValueError(f"Missing field in AI response: {field}")
+
+        return result
 
     except HTTPException:
         raise
     except Exception as e:
         error_str = str(e)
-        print(f"[evaluate] FULL ERROR TYPE: {type(e).__name__}")
-        print(f"[evaluate] FULL ERROR STR: {error_str}")
+        print(f"[evaluate] ERROR TYPE: {type(e).__name__}")
+        print(f"[evaluate] ERROR: {error_str}")
 
         if "503" in error_str or "UNAVAILABLE" in error_str:
             raise HTTPException(
@@ -195,11 +208,6 @@ async def evaluate_action(req: ActionRequest, request: Request):
         if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
             raise HTTPException(
                 status_code=429,
-                detail="API quota exhausted for today. The game will resume tomorrow."
-            )
-        if "NOT_FOUND" in error_str:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Model error: {error_str[:400]}"
+                detail="API quota exhausted. Please wait a while and try again."
             )
         raise HTTPException(status_code=500, detail=f"Evaluation Error: {error_str[:500]}")
