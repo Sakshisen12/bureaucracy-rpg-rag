@@ -25,7 +25,7 @@ retriever: BM25Retriever | None = None
 # Free tier: ~14,400 requests/day, 30 req/min
 # ---------------------------------------------------------------------------
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "llama3-70b-8192"
 GROQ_MODEL_FALLBACK = "llama3-8b-8192"  # smaller/faster fallback
 
 # ---------------------------------------------------------------------------
