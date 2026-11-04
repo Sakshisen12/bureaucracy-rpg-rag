@@ -24,7 +24,9 @@ retriever: BM25Retriever | None = None
 # Gemini REST API — uses stable v1beta endpoint directly with httpx
 # No Google SDK needed, works with any valid AI Studio API key
 # ---------------------------------------------------------------------------
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_MODEL = "gemini-2.0-flash"  # updated model name
+GEMINI_URL = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
 
 # ---------------------------------------------------------------------------
 # Simple in-memory rate limiter
@@ -131,8 +133,26 @@ def read_root():
     return {
         "status": "online",
         "message": "Bureaucracy RPG API is running!",
-        "rate_limit": f"{MAX_REQUESTS_PER_WINDOW} evaluations/hour per user"
+        "rate_limit": f"{MAX_REQUESTS_PER_WINDOW} evaluations/hour per user",
+        "model": GEMINI_MODEL
     }
+
+
+@app.get("/models")
+async def list_models():
+    """Debug endpoint — lists all Gemini models available for the configured API key."""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        return {"error": "GOOGLE_API_KEY not set in environment"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{GEMINI_BASE}/models",
+                params={"key": api_key}
+            )
+        return {"status": resp.status_code, "body": resp.json()}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.post("/upload")
