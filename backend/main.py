@@ -26,7 +26,9 @@ retriever: BM25Retriever | None = None
 # ---------------------------------------------------------------------------
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODEL_FALLBACK = "gemini-1.5-flash"  # fallback if primary is overloaded
 GEMINI_URL = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
+GEMINI_URL_FALLBACK = f"{GEMINI_BASE}/models/{GEMINI_MODEL_FALLBACK}:generateContent"
 
 # ---------------------------------------------------------------------------
 # Simple in-memory rate limiter
@@ -48,7 +50,7 @@ def check_rate_limit(ip: str):
     _rate_limit_store[ip].append(now)
 
 
-async def call_gemini(api_key: str, prompt: str, max_retries: int = 3) -> dict:
+async def call_gemini(api_key: str, prompt: str, max_retries: int = 5) -> dict:
     """Call Gemini REST API directly. Returns parsed JSON dict."""
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -62,15 +64,18 @@ async def call_gemini(api_key: str, prompt: str, max_retries: int = 3) -> dict:
 
     last_error = None
     for attempt in range(max_retries):
+        # Switch to fallback model on last 2 attempts if primary keeps failing
+        url = GEMINI_URL_FALLBACK if attempt >= max_retries - 2 else GEMINI_URL
+        model_used = GEMINI_MODEL_FALLBACK if attempt >= max_retries - 2 else GEMINI_MODEL
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=45.0) as client:
                 resp = await client.post(
-                    GEMINI_URL,
+                    url,
                     json=body,
                     params={"key": api_key}
                 )
 
-            print(f"[gemini] status={resp.status_code} attempt={attempt+1}")
+            print(f"[gemini] model={model_used} status={resp.status_code} attempt={attempt+1}")
 
             if resp.status_code == 429:
                 raw = resp.text
@@ -97,12 +102,12 @@ async def call_gemini(api_key: str, prompt: str, max_retries: int = 3) -> dict:
                 )
             if resp.status_code == 503:
                 if attempt < max_retries - 1:
-                    wait = 2 ** attempt
-                    print(f"[gemini] 503, retrying in {wait}s")
+                    wait = min(5 * (2 ** attempt), 30)  # 5s, 10s, 20s, 30s, 30s
+                    print(f"[gemini] 503 overloaded, retrying in {wait}s (attempt {attempt+1}/{max_retries}, model={model_used})")
                     time.sleep(wait)
                     last_error = Exception("503 UNAVAILABLE")
                     continue
-                raise HTTPException(status_code=503, detail="Google AI is overloaded. Try again in 10 seconds.")
+                raise HTTPException(status_code=503, detail="Google AI servers are overloaded right now. This is a temporary Google issue — please wait 30 seconds and try again.")
             if resp.status_code == 404:
                 detail = resp.text[:500]
                 print(f"[gemini] 404 error: {detail}")
