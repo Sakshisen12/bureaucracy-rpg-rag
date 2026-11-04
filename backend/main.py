@@ -25,7 +25,7 @@ retriever: BM25Retriever | None = None
 # No Google SDK needed, works with any valid AI Studio API key
 # ---------------------------------------------------------------------------
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
-GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 GEMINI_URL = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
 
 # ---------------------------------------------------------------------------
@@ -54,7 +54,9 @@ async def call_gemini(api_key: str, prompt: str, max_retries: int = 3) -> dict:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.3,
-            "responseMimeType": "application/json"
+            "responseMimeType": "application/json",
+            # Disable thinking mode — saves quota and avoids parsing thought chunks
+            "thinkingConfig": {"thinkingBudget": 0}
         }
     }
 
@@ -68,10 +70,15 @@ async def call_gemini(api_key: str, prompt: str, max_retries: int = 3) -> dict:
                     params={"key": api_key}
                 )
 
-            print(f"[gemini] status={resp.status_code}")
+            print(f"[gemini] status={resp.status_code} attempt={attempt+1}")
 
             if resp.status_code == 429:
-                raise HTTPException(status_code=429, detail="API quota exhausted. Please wait a while and try again.")
+                raw = resp.text
+                print(f"[gemini] 429 raw: {raw[:300]}")
+                raise HTTPException(
+                    status_code=429,
+                    detail="Rate limit hit — please wait 60 seconds and try again (free tier: ~10 req/min)."
+                )
             if resp.status_code == 503:
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
@@ -91,12 +98,17 @@ async def call_gemini(api_key: str, prompt: str, max_retries: int = 3) -> dict:
                 raise HTTPException(status_code=500, detail=f"Gemini API error {resp.status_code}: {resp.text[:300]}")
 
             data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            parts = data["candidates"][0]["content"]["parts"]
+
+            # Thinking models return thought chunks first, then the real answer.
+            # Skip any part marked with "thought": true and take the last remaining part.
+            answer_parts = [p["text"] for p in parts if not p.get("thought", False)]
+            text = (answer_parts[-1] if answer_parts else parts[-1]["text"]).strip()
 
             # Strip markdown code fences if present
             if text.startswith("```"):
                 lines = text.split("\n")
-                text = "\n".join(lines[1:-1])
+                text = "\n".join(lines[1:-1]).strip()
 
             return json.loads(text)
 
