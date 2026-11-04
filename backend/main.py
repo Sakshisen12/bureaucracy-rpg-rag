@@ -31,7 +31,7 @@ GEMINI_URL = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
 # ---------------------------------------------------------------------------
 # Simple in-memory rate limiter
 # ---------------------------------------------------------------------------
-MAX_REQUESTS_PER_WINDOW = 10
+MAX_REQUESTS_PER_WINDOW = 20
 WINDOW_SECONDS = 60 * 60
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
 
@@ -75,9 +75,25 @@ async def call_gemini(api_key: str, prompt: str, max_retries: int = 3) -> dict:
             if resp.status_code == 429:
                 raw = resp.text
                 print(f"[gemini] 429 raw: {raw[:300]}")
+
+                # Check if daily quota is exhausted (no point retrying)
+                if "quota" in raw.lower() or "exhausted" in raw.lower() or "day" in raw.lower():
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Daily API quota exhausted. The free tier allows limited requests per day. Please try again tomorrow or upgrade your API plan at aistudio.google.com."
+                    )
+
+                # Per-minute rate limit — retry with backoff
+                if attempt < max_retries - 1:
+                    wait = 15 * (attempt + 1)  # 15s, 30s, 45s
+                    print(f"[gemini] 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    last_error = Exception("429 RATE_LIMIT")
+                    continue
+
                 raise HTTPException(
                     status_code=429,
-                    detail="Rate limit hit — please wait 60 seconds and try again (free tier: ~10 req/min)."
+                    detail="Google API rate limit hit. Free tier allows ~15 requests/min. Please wait 1-2 minutes and try again."
                 )
             if resp.status_code == 503:
                 if attempt < max_retries - 1:
