@@ -7,8 +7,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-import google.generativeai as genai
+import httpx
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -22,12 +21,16 @@ load_dotenv()
 retriever: BM25Retriever | None = None
 
 # ---------------------------------------------------------------------------
-# Simple in-memory rate limiter
-# Limits each IP to MAX_REQUESTS_PER_WINDOW evaluate calls per time window.
-# Resets after WINDOW_SECONDS. Stored in memory (resets on redeploy).
+# Gemini REST API — uses stable v1beta endpoint directly with httpx
+# No Google SDK needed, works with any valid AI Studio API key
 # ---------------------------------------------------------------------------
-MAX_REQUESTS_PER_WINDOW = 10        # max /evaluate calls per IP
-WINDOW_SECONDS = 60 * 60            # 1 hour window
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+
+# ---------------------------------------------------------------------------
+# Simple in-memory rate limiter
+# ---------------------------------------------------------------------------
+MAX_REQUESTS_PER_WINDOW = 10
+WINDOW_SECONDS = 60 * 60
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
 
 
@@ -43,38 +46,72 @@ def check_rate_limit(ip: str):
     _rate_limit_store[ip].append(now)
 
 
-# ---------------------------------------------------------------------------
-# Call Gemini with retry logic for transient errors
-# ---------------------------------------------------------------------------
-def call_gemini_with_retry(model, prompt: str, max_retries: int = 3) -> dict:
-    """Call Gemini directly and parse JSON response, with exponential backoff."""
+async def call_gemini(api_key: str, prompt: str, max_retries: int = 3) -> dict:
+    """Call Gemini REST API directly. Returns parsed JSON dict."""
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.3,
+            "responseMimeType": "application/json"
+        }
+    }
+
     last_error = None
     for attempt in range(max_retries):
         try:
-            response = model.generate_content(prompt)
-            text = response.text.strip()
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    GEMINI_URL,
+                    json=body,
+                    params={"key": api_key}
+                )
+
+            print(f"[gemini] status={resp.status_code}")
+
+            if resp.status_code == 429:
+                raise HTTPException(status_code=429, detail="API quota exhausted. Please wait a while and try again.")
+            if resp.status_code == 503:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    print(f"[gemini] 503, retrying in {wait}s")
+                    time.sleep(wait)
+                    last_error = Exception("503 UNAVAILABLE")
+                    continue
+                raise HTTPException(status_code=503, detail="Google AI is overloaded. Try again in 10 seconds.")
+            if resp.status_code == 404:
+                detail = resp.text[:500]
+                print(f"[gemini] 404 error: {detail}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Gemini API 404 — check your GOOGLE_API_KEY in Render. Raw: {detail[:300]}"
+                )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=500, detail=f"Gemini API error {resp.status_code}: {resp.text[:300]}")
+
+            data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
             # Strip markdown code fences if present
             if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
+                lines = text.split("\n")
+                text = "\n".join(lines[1:-1])
+
             return json.loads(text)
+
+        except HTTPException:
+            raise
         except Exception as e:
-            error_str = str(e)
-            is_retryable = "503" in error_str or "429" in error_str or "UNAVAILABLE" in error_str
-            if is_retryable and attempt < max_retries - 1:
-                wait = 2 ** attempt
-                print(f"[evaluate] Transient error (attempt {attempt+1}), retrying in {wait}s: {e}")
-                time.sleep(wait)
-                last_error = e
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
             else:
-                raise e
+                raise
+
     raise last_error
 
 
 app = FastAPI()
 
-# CORS — allow_credentials MUST be False when allow_origins=["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -118,9 +155,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_documents(docs)
 
-        # BM25 — pure Python keyword retrieval, zero API calls
         retriever = BM25Retriever.from_documents(chunks, k=3)
-
         return {"status": "success", "message": f"Processed {len(chunks)} chunks from {len(docs)} pages"}
 
     except HTTPException:
@@ -138,7 +173,6 @@ async def evaluate_action(req: ActionRequest, request: Request):
     if retriever is None:
         raise HTTPException(status_code=400, detail="Upload a PDF document first!")
 
-    # Rate limit by IP to protect API key quota
     client_ip = request.headers.get("x-forwarded-for", request.client.host)
     check_rate_limit(client_ip)
 
@@ -149,21 +183,10 @@ async def evaluate_action(req: ActionRequest, request: Request):
             detail="GOOGLE_API_KEY missing — add it in Render Environment settings."
         )
 
-    try:
-        docs = retriever.invoke(req.action)
-        context = "\n\n".join([doc.page_content for doc in docs])
+    docs = retriever.invoke(req.action)
+    context = "\n\n".join([doc.page_content for doc in docs])
 
-        # Configure Google Generative AI directly (no langchain wrapper)
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.3,
-                response_mime_type="application/json",
-            )
-        )
-
-        prompt = f"""You are a humorous compliance Game Master evaluating an employee's action against company policies.
+    prompt = f"""You are a humorous compliance Game Master evaluating an employee's action against company policies.
 
 DOCUMENT RULES CONTEXT:
 {context}
@@ -183,31 +206,12 @@ Evaluate the action against the document rules. Respond ONLY with a valid JSON o
   "sanity_change": <integer between -20 and +5>
 }}"""
 
-        result = call_gemini_with_retry(model, prompt)
+    result = await call_gemini(api_key, prompt)
 
-        # Validate required fields exist
-        required = ["narrative", "clause_cited", "compliance_change", "budget_change", "sanity_change"]
-        for field in required:
-            if field not in result:
-                raise ValueError(f"Missing field in AI response: {field}")
+    # Validate required fields
+    required = ["narrative", "clause_cited", "compliance_change", "budget_change", "sanity_change"]
+    for field in required:
+        if field not in result:
+            raise HTTPException(status_code=500, detail=f"Incomplete AI response — missing field: {field}")
 
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        error_str = str(e)
-        print(f"[evaluate] ERROR TYPE: {type(e).__name__}")
-        print(f"[evaluate] ERROR: {error_str}")
-
-        if "503" in error_str or "UNAVAILABLE" in error_str:
-            raise HTTPException(
-                status_code=503,
-                detail="Google AI is temporarily overloaded. Please wait 10 seconds and try again."
-            )
-        if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-            raise HTTPException(
-                status_code=429,
-                detail="API quota exhausted. Please wait a while and try again."
-            )
-        raise HTTPException(status_code=500, detail=f"Evaluation Error: {error_str[:500]}")
+    return result

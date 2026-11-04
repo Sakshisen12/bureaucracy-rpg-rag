@@ -6,6 +6,6 @@ python-multipart
 langchain
 langchain-community
 langchain-core
-google-generativeai
+httpx
 pypdf
 rank_bm25
