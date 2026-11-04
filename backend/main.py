@@ -21,23 +21,30 @@ load_dotenv()
 retriever: BM25Retriever | None = None
 
 # ---------------------------------------------------------------------------
-# Groq REST API — OpenAI-compatible endpoint, no SDK needed
-# Free tier: ~14,400 requests/day, 30 req/min
-#
-# Models listed in preference order — the app tries each one automatically.
-# If a model is decommissioned or unavailable, it moves to the next.
+# Groq REST API — OpenAI-compatible endpoint
+# Models are fetched dynamically from Groq at startup so this never breaks
 # ---------------------------------------------------------------------------
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_BASE = "https://api.groq.com/openai/v1"
+GROQ_URL  = f"{GROQ_BASE}/chat/completions"
 
-GROQ_MODELS = [
-    "llama-3.1-8b-instant",        # ✅ confirmed active on free tier
-    "llama-3.1-70b-versatile",     # larger model, may need access
-    "llama-3.3-70b-versatile",     # newest 70B
-    "llama3-groq-8b-8192-tool-use-preview",  # preview fallback
+# Models to skip (audio/vision/moderation — not text chat models)
+_SKIP_KEYWORDS = ["whisper", "distil-whisper", "guard", "vision", "tts", "playai"]
+
+# Preferred model substrings in priority order
+_PREFERRED = [
+    "llama-3.3",
+    "llama-3.1-70b",
+    "llama-3.1-8b",
+    "llama3-70b",
+    "llama3-8b",
+    "llama",
+    "gemma",
+    "mixtral",
 ]
 
-# Cache which model worked so we don't retry unavailable ones every request
-_working_model: str | None = None
+# Resolved at runtime
+_active_model: str | None = None
+_fallback_models: list[str] = []
 
 # ---------------------------------------------------------------------------
 # Simple in-memory rate limiter
@@ -59,29 +66,78 @@ def check_rate_limit(ip: str):
     _rate_limit_store[ip].append(now)
 
 
+async def fetch_available_models(api_key: str) -> list[str]:
+    """Fetch all active text-chat models from Groq API."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{GROQ_BASE}/models",
+                headers={"Authorization": f"Bearer {api_key}"}
+            )
+        if resp.status_code != 200:
+            print(f"[groq] Could not fetch models: {resp.status_code} {resp.text[:200]}")
+            return []
+
+        all_models = [m["id"] for m in resp.json().get("data", [])]
+
+        # Filter out non-text-chat models
+        text_models = [
+            m for m in all_models
+            if not any(kw in m.lower() for kw in _SKIP_KEYWORDS)
+        ]
+
+        # Sort by preference
+        def priority(model_id: str) -> int:
+            for i, pref in enumerate(_PREFERRED):
+                if pref in model_id.lower():
+                    return i
+            return len(_PREFERRED)
+
+        text_models.sort(key=priority)
+        print(f"[groq] Available text models: {text_models}")
+        return text_models
+
+    except Exception as e:
+        print(f"[groq] Error fetching models: {e}")
+        return []
+
+
+async def ensure_models_loaded(api_key: str):
+    """Populate _active_model and _fallback_models if not already set."""
+    global _active_model, _fallback_models
+    if _active_model:
+        return
+    models = await fetch_available_models(api_key)
+    if not models:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not fetch Groq model list. Check your GROQ_API_KEY in Render Environment settings."
+        )
+    _active_model = models[0]
+    _fallback_models = models[1:]
+    print(f"[groq] Primary model: {_active_model}, Fallbacks: {_fallback_models}")
+
+
 async def call_groq(api_key: str, prompt: str) -> dict:
     """
-    Call Groq REST API. Automatically tries each model in GROQ_MODELS
-    until one succeeds, skipping decommissioned or unavailable ones.
+    Call Groq REST API. Auto-detects available models on first call.
+    Skips any model that returns 404 / decommissioned and tries the next.
     """
-    global _working_model
+    global _active_model, _fallback_models
+
+    await ensure_models_loaded(api_key)
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
-    # Try cached working model first, then fall through the full list
-    models_to_try = []
-    if _working_model:
-        models_to_try.append(_working_model)
-    for m in GROQ_MODELS:
-        if m not in models_to_try:
-            models_to_try.append(m)
-
+    models_to_try = [_active_model] + list(_fallback_models)
     last_error: Exception | None = None
 
     for model in models_to_try:
+        if not model:
+            continue
         body = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -94,23 +150,17 @@ async def call_groq(api_key: str, prompt: str) -> dict:
 
             print(f"[groq] model={model} status={resp.status_code}")
 
-            # Model not available on this account — skip to next
-            if resp.status_code == 404:
-                print(f"[groq] {model} → 404 not found, trying next model...")
-                last_error = Exception(f"{model}: 404 not found")
-                if model == _working_model:
-                    _working_model = None  # invalidate cache
+            # Model gone — skip to next and invalidate cache
+            if resp.status_code == 404 or (
+                resp.status_code == 400 and
+                any(kw in resp.text for kw in ["decommissioned", "model_not_found", "does not exist"])
+            ):
+                print(f"[groq] {model} unavailable, trying next...")
+                last_error = Exception(f"{model}: unavailable")
+                if _active_model == model:
+                    _active_model = _fallback_models[0] if _fallback_models else None
+                    _fallback_models = _fallback_models[1:] if _fallback_models else []
                 continue
-
-            # Decommissioned or bad model name — skip to next
-            if resp.status_code == 400:
-                raw = resp.text
-                if "decommissioned" in raw or "model_not_found" in raw or "does not exist" in raw:
-                    print(f"[groq] {model} → decommissioned/not found, trying next model...")
-                    last_error = Exception(f"{model}: decommissioned")
-                    if model == _working_model:
-                        _working_model = None
-                    continue
 
             if resp.status_code == 401:
                 raise HTTPException(
@@ -123,31 +173,29 @@ async def call_groq(api_key: str, prompt: str) -> dict:
                 if "daily" in raw.lower() or "exhausted" in raw.lower():
                     raise HTTPException(
                         status_code=429,
-                        detail="Groq daily quota exhausted. Free tier allows ~14,400 req/day. Try again tomorrow or visit console.groq.com."
+                        detail="Groq daily quota exhausted (~14,400 req/day on free tier). Try again tomorrow."
                     )
-                # Per-minute rate limit — wait briefly and retry same model
-                print(f"[groq] {model} → rate limited, waiting 15s...")
+                print(f"[groq] Rate limited on {model}, waiting 15s...")
                 time.sleep(15)
                 continue
 
             if resp.status_code == 503:
-                print(f"[groq] {model} → 503 overloaded, waiting 10s...")
+                print(f"[groq] {model} overloaded, waiting 10s...")
                 time.sleep(10)
                 continue
 
             if resp.status_code != 200:
-                print(f"[groq] {model} → error {resp.status_code}: {resp.text[:200]}")
+                print(f"[groq] {model} error {resp.status_code}: {resp.text[:200]}")
                 last_error = Exception(f"{model}: HTTP {resp.status_code}")
                 continue
 
-            # ✅ Success — cache this model
-            _working_model = model
+            # ✅ Success — promote this model as primary
+            _active_model = model
             print(f"[groq] ✅ success with model={model}")
 
             data = resp.json()
             text = data["choices"][0]["message"]["content"].strip()
 
-            # Strip markdown code fences if present
             if text.startswith("```"):
                 lines = text.split("\n")
                 text = "\n".join(lines[1:-1]).strip()
@@ -164,8 +212,8 @@ async def call_groq(api_key: str, prompt: str) -> dict:
     raise HTTPException(
         status_code=503,
         detail=(
-            f"All Groq models failed or are unavailable. Last error: {last_error}. "
-            "Visit console.groq.com to check which models are active for your account."
+            f"All Groq models failed. Last error: {last_error}. "
+            "Visit /models endpoint to see what is available on your account."
         )
     )
 
@@ -192,26 +240,18 @@ def read_root():
         "status": "online",
         "message": "Bureaucracy RPG API is running!",
         "rate_limit": f"{MAX_REQUESTS_PER_WINDOW} evaluations/hour per user",
-        "models": GROQ_MODELS,
-        "active_model": _working_model or "auto-detect on first request"
+        "active_model": _active_model or "not yet resolved (will auto-detect on first request)",
     }
 
 
 @app.get("/models")
 async def list_models():
-    """Debug endpoint — lists all Groq models available for the configured API key."""
+    """Lists all Groq text-chat models available for the configured API key."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         return {"error": "GROQ_API_KEY not set in environment"}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                "https://api.groq.com/openai/v1/models",
-                headers={"Authorization": f"Bearer {api_key}"}
-            )
-        return {"status": resp.status_code, "body": resp.json()}
-    except Exception as e:
-        return {"error": str(e)}
+    models = await fetch_available_models(api_key)
+    return {"available_text_models": models, "active_model": _active_model}
 
 
 @app.post("/upload")
@@ -287,7 +327,6 @@ Evaluate the action against the document rules. Respond ONLY with a valid JSON o
 
     result = await call_groq(api_key, prompt)
 
-    # Validate required fields
     required = ["narrative", "clause_cited", "compliance_change", "budget_change", "sanity_change"]
     for field in required:
         if field not in result:
