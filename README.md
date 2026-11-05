@@ -18,6 +18,7 @@ Every decision you make — expensing a client dinner, requesting equipment, ski
 
 - 📄 **Upload any policy PDF** — the game adapts to *your* rules
 - 🤖 **AI-powered Game Master** — uses Groq (Llama) to narrate consequences and cite exact document clauses
+- 🧠 **Dynamic Conversation History** — the Game Master remembers your previous moves, escalating consequences for repeat violations or praising compliance streaks
 - 🔍 **BM25 Retrieval** — pure-Python keyword-based document search, no embeddings or PyTorch required
 - 📊 **Live Player HUD** — tracks Compliance %, Budget ($), and Sanity % in real-time
 - ⚡ **Quick Action Presets** — one-click scenarios to jump straight into gameplay
@@ -190,7 +191,11 @@ Evaluate a player action against the loaded document.
     "compliance": 85,
     "budget": 420,
     "sanity": 70
-  }
+  },
+  "conversation_history": [
+    { "role": "user", "content": "Requested ergonomic chair without approval" },
+    { "role": "assistant", "content": "HR denied your chair request citing Form 22-A." }
+  ]
 }
 ```
 

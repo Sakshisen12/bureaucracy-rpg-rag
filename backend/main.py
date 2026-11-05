@@ -229,9 +229,14 @@ app.add_middleware(
 )
 
 
+class ConversationTurn(BaseModel):
+    role: str   # "user" or "assistant"
+    content: str
+
 class ActionRequest(BaseModel):
     action: str
     game_state: dict
+    conversation_history: list[ConversationTurn] = []  # last N turns for context
 
 
 @app.get("/")
@@ -305,20 +310,38 @@ async def evaluate_action(req: ActionRequest, request: Request):
     docs = retriever.invoke(req.action)
     context = "\n\n".join([doc.page_content for doc in docs])
 
-    prompt = f"""You are a humorous compliance Game Master evaluating an employee's action against company policies.
+    # Build conversation history for context (last 5 turns max to stay within token limits)
+    history_text = ""
+    if req.conversation_history:
+        recent = req.conversation_history[-10:]  # last 5 turns = 10 messages (user+assistant)
+        lines = []
+        for turn in recent:
+            prefix = "Employee" if turn.role == "user" else "Game Master"
+            lines.append(f"{prefix}: {turn.content}")
+        history_text = "\n".join(lines)
 
+    history_section = f"""
+CONVERSATION HISTORY (last turns — use this to build a consistent, escalating story):
+{history_text}
+""" if history_text else ""
+
+    prompt = f"""You are a humorous compliance Game Master evaluating an employee's action against company policies.
+You remember all previous turns and build an escalating, coherent story across the session.
+{history_section}
 DOCUMENT RULES CONTEXT:
 {context}
 
 CURRENT PLAYER STATS:
 {req.game_state}
 
-PLAYER ACTION:
+CURRENT PLAYER ACTION:
 {req.action}
 
-Evaluate the action against the document rules. Respond ONLY with a valid JSON object with exactly these fields:
+Evaluate this action against the document rules, taking into account the history above.
+If the player is a repeat offender, escalate consequences. If they're on a good streak, acknowledge it.
+Respond ONLY with a valid JSON object with exactly these fields:
 {{
-  "narrative": "A humorous 2-3 sentence story consequence of the action, referencing the policy",
+  "narrative": "A humorous 2-3 sentence story consequence referencing the policy AND prior events if relevant",
   "clause_cited": "The exact section/clause name from the document that applies",
   "compliance_change": <integer between -30 and +10>,
   "budget_change": <integer, negative means money spent>,

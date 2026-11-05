@@ -89,9 +89,17 @@ const handleFileUpload = async (e) => {
     setLoading(true);
 
     try {
+      const conversationHistory = history
+        .filter(turn => turn.action !== "System Ready" && turn.action !== "System Reset")
+        .flatMap(turn => [
+          { role: 'user', content: turn.action },
+          { role: 'assistant', content: turn.narrative }
+        ]);
+
       const payload = {
         action: actionText,
-        game_state: gameState
+        game_state: gameState,
+        conversation_history: conversationHistory
       };
 
       const response = await axios.post(`${API_BASE_URL}/evaluate`, payload);
