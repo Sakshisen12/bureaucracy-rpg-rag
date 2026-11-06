@@ -156,7 +156,7 @@ const handleFileUpload = async (e) => {
             ⚖️ BUREAUCRACY SURVIVAL RPG
           </h1>
           <p className="text-sm md:text-base font-bold mt-1 text-black/80">
-            RAG Constraint-Checking Engine • React & FastAPI
+            RAG Constraint-Checking Engine
           </p>
         </div>
         <button 
